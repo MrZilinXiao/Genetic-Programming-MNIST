@@ -2,8 +2,11 @@
 A demo of using Genetic Programming to classify MNIST hand-written digits dataset.
 """
 
-from deap import base, creator, tools, gp, algorithms
-import multiprocessing
+from deap import base, creator, tools, gp
+from HOF import HallOfFame
+# from deap import base, creator, tools, gp
+import algorithms
+import selection
 from dataset import get_mnist
 from sklearn import metrics
 from bisect import bisect_left
@@ -17,7 +20,7 @@ SEED = 233333  # random seed
 # hyper-params of genetic programming
 POP_SIZE = 50
 GEN_NO = 40
-# POP_SIZE = 10
+# POP_SIZE = 2
 # GEN_NO = 3
 INIT_MIN_DEPTH = 2
 INIT_MAX_DEPTH = 6
@@ -56,8 +59,12 @@ def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 
-def norm(x):
+def img_norm(x):
     return x / 255.0
+
+
+def feat_norm(x):  # linearly norm into [-1, 1]
+    return 2 * (x - np.min(x)) / (np.max(x) - np.min(x)) - 1
 
 
 def flatten(x):
@@ -65,12 +72,15 @@ def flatten(x):
 
 
 class MNIST_GP:
-    def __init__(self, num_feat=10):
+    def __init__(self, num_feat=10, range_type='SRS'):
         self.set_creator()
         self.pset = self.get_primitive_set(num_feat)
         self.mstats = self.get_stats()
         self.toolbox = self.get_toolbox()
-        self.labels = list(np.linspace(0, 1, NUM_CLASSES, endpoint=False))  # [0, 0.1, 0.2, ..., 0.9] if num_class = 10
+        # self.labels = list(np.linspace(0, 1, NUM_CLASSES, endpoint=False))  # boundaries at fixed distance[0, 0.1, 0.2, ..., 0.9] if num_class = 10
+        self.labels = list(
+            sorted([random.random() for _ in range(NUM_CLASSES)]))  # Static Range Selection (SRS) by default
+        self.range_type = range_type
         self.tree, self.log = None, None  # tree remains None if haven't gone through `fit`
 
     @staticmethod
@@ -89,7 +99,7 @@ class MNIST_GP:
 
     @staticmethod
     def get_stats():
-        stats_fit = tools.Statistics(lambda ind: ind.fitness.values)
+        stats_fit = tools.Statistics(lambda ind: ind.fitness.values[0])
         stats_size = tools.Statistics(len)
         mstats = tools.MultiStatistics(fitness=stats_fit, size=stats_size)
         mstats.register("avg", np.mean)
@@ -106,7 +116,7 @@ class MNIST_GP:
         toolbox.register("compile", gp.compile, pset=self.pset)
 
         # Tournament size
-        toolbox.register("select", tools.selTournament, tournsize=TOURNAMENT_SIZE)
+        toolbox.register("select", selection.selTournament, tournsize=TOURNAMENT_SIZE)
         toolbox.register("mate", gp.cxOnePoint)
         toolbox.register("expr_mut", gp.genFull, min_=MUT_EXPR_MIN_DEPTH, max_=MUT_EXPR_MAX_DEPTH)
         toolbox.register("mutate", gp.mutUniform, expr=toolbox.expr_mut, pset=self.pset)
@@ -132,26 +142,33 @@ class MNIST_GP:
         feats.extend(feat_func(flatten(data[:, 15:28, 0:14])))
         feats.extend(feat_func(flatten(data[:, 0:14, 15:28])))
         feats.extend(feat_func(flatten(data[:, 15:28, 15:28])))
-        return np.vstack(feats).transpose().tolist()  # [N, 10]
+        return feat_norm(np.vstack(feats)).transpose().tolist()  # [N, 10]
 
     def get_label_by_output(self, pred_value):
-        return bisect_left(self.labels, pred_value) - 1  # 0~9 if pred_value in (0,1)
+        idx = bisect_left(self.labels, pred_value) - 1  # 0~9 if pred_value in (0,1)
+        if idx < 0:
+            return 0
+        if idx > len(self.labels):
+            return len(self.labels)
+        return idx
 
     def predict_ind(self, ind, data):
         tree = self.toolbox.compile(expr=ind)
-        feats = self.get_feature(norm(data))  # [N, 10]
-        pred_labels = [self.get_label_by_output(sigmoid(tree(*feat))) for feat in feats]  # for each image
-
-        return np.asarray(pred_labels)
+        feats = self.get_feature(img_norm(data))  # [N, 10]
+        output_values = [sigmoid(tree(*feat)) for feat in feats]  # N
+        # pred_labels = [self.get_label_by_output(sigmoid(tree(*feat))) for feat in feats]  # for each image
+        pred_labels = [self.get_label_by_output(v) for v in output_values]  # N
+        return np.asarray(pred_labels), np.asarray(output_values)
 
     def fitness_func(self, ind, data, gt_labels):  # should be registered under `evaluate`
-        pred_labels = self.predict_ind(ind, data)
+        pred_labels, output_values = self.predict_ind(ind, data)
         acc = metrics.accuracy_score(gt_labels, pred_labels)
-        return acc,  # comma needed since deap treats everything as Iterable
+        return acc, output_values, gt_labels  # comma needed since deap treats everything as Iterable
 
     @staticmethod
     def set_creator():
-        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        creator.create("FitnessMax", base.Fitness,
+                       weights=(1.0, 1.0, 1.0))  # ignore output_values by setting its weight at 0
         creator.create("Individual", gp.PrimitiveTree, fitness=creator.FitnessMax)
 
     def fit(self, X_train, Y_train):
@@ -161,13 +178,14 @@ class MNIST_GP:
         :param Y_train: [N]
         :return: None, but self.tree will be recorded through tools.HallOfFame
         """
-        set_seed()
         self.toolbox.register('evaluate', self.fitness_func, data=X_train, gt_labels=Y_train)
         pop = self.toolbox.population(n=POP_SIZE)
-        hof = tools.HallOfFame(1)
+        hof = HallOfFame(1)
         pop, log = algorithms.eaSimple(pop, self.toolbox, CROSSOVER_PB,
-                                       MUTATION_PB, GEN_NO, stats=self.mstats,
-                                       halloffame=hof, verbose=True)
+                                       MUTATION_PB, GEN_NO,
+                                       stats=self.mstats,
+                                       halloffame=hof, verbose=True,
+                                       num_classes=10 if self.range_type == 'CDRS' else None)
         self.log = log
         self.tree = hof[0]
 
@@ -180,12 +198,13 @@ class MNIST_GP:
         """
         if self.tree is None:
             raise RuntimeError("GP haven't been trained via fit()!")
-        pred_labels = self.predict_ind(self.tree, X_test)
+        pred_labels, _ = self.predict_ind(self.tree, X_test)
         acc = None if Y_test is None else metrics.accuracy_score(pred_labels, Y_test)
         return pred_labels, acc
 
 
 def main():
+    set_seed()
     X_train, Y_train, X_test, Y_test = get_mnist()
     model = MNIST_GP()
 
